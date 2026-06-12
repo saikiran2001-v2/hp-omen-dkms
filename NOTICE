@@ -1,0 +1,41 @@
+omen-dkms — Attribution and modification policy
+================================================
+
+This project is a modified version of the Linux kernel `hp-wmi` driver and
+related HP OMEN platform support code.
+
+Upstream copyright holders include, without limitation:
+
+  - Matthew Garrett and Red Hat contributors
+  - Anssi Hannula
+  - Miloslav Trmac, Bernhard Rosenkraenzer, Dmitry Torokhov
+  - The Linux kernel development community
+
+Fork modifications in this repository are Copyright (C) 2026 saikiran
+<bjsaikiran@gmail.com>.
+
+You are free to modify and redistribute this software under the terms of the
+GNU General Public License version 2, as published by the Free Software
+Foundation. See the LICENSE file for the full license text.
+
+Attribution requirements
+------------------------
+
+When you distribute source or binary forms of this project, whether modified
+or unmodified, you must:
+
+  1. Retain all existing copyright and license notices in source files.
+  2. Retain this NOTICE file (or reproduce its substance in your documentation).
+  3. Clearly document any changes you make relative to this repository.
+  4. Not represent upstream or fork authorship as solely your own when
+     substantial portions of the code originate from this project or from the
+     Linux kernel `hp-wmi` driver.
+
+In short: modify freely, but give credit where it is due.
+
+Disclaimer
+----------
+
+This software is provided without warranty. Use at your own risk. Incorrect
+firmware or EC interaction can affect thermal behavior, fan control, and
+other platform functions.
