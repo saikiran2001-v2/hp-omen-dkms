@@ -542,17 +542,6 @@
   * 120s timeout
   */
  #define KEEP_ALIVE_DELAY_SECS     90
-/*
- * Hold max-fan edge long enough for EC firmware to reliably latch
- * before handing control back to automatic mode.
- */
-#define USERDEFINED_EXIT_PULSE_MS 1500
-/*
- * Some boards miss a single 1->0 edge while exiting userdefined mode.
- * Retry the exit edge a few times with a short settle delay.
- */
-#define USERDEFINED_EXIT_RETRIES  3
-#define USERDEFINED_EXIT_SETTLE_MS 200
 
  static inline u8 rpm_to_pwm(u8 rpm, struct hp_wmi_hwmon_priv *priv)
  {
@@ -866,93 +855,6 @@ static int hp_wmi_fourzone_set(u8 commandtype, void *buffer, size_t size)
  
 	 return enabled;
  }
-
-static int hp_wmi_fan_speed_max_get(void)
-{
-	int val = 0, ret;
-
-	ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_GET_QUERY, HPWMI_GM,
-				   &val, zero_if_sup(val), sizeof(val));
-	if (ret)
-		return ret < 0 ? ret : -EINVAL;
-
-	return val;
-}
-
-static int hp_wmi_fan_speed_max_set_verify(int enabled, int attempts)
-{
-	int ret, mode_val, i;
-
-	for (i = 0; i < attempts; i++) {
-		ret = hp_wmi_fan_speed_max_set(enabled);
-		if (ret < 0)
-			return ret;
-
-		mode_val = hp_wmi_fan_speed_max_get();
-		if (mode_val == enabled)
-			return 0;
-
-		if (mode_val < 0)
-			return mode_val;
-
-		/* Give EC/firmware time to settle before retrying. */
-		msleep(80);
-	}
-
-	pr_warn_ratelimited("fan max mode verify mismatch: wanted=%d\n", enabled);
-	return -EIO;
-}
-
-static int hp_wmi_omen_fan_speed_reset(void)
-{
-	u8 fan_speed[2] = { HP_FAN_SPEED_AUTOMATIC, HP_FAN_SPEED_AUTOMATIC };
-
-	return hp_wmi_perform_query(HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY, HPWMI_GM,
-				    &fan_speed, sizeof(fan_speed), 0);
-}
-
-static int hp_wmi_omen_exit_userdefined_mode(void)
-{
-	int ret, i;
-
-	/*
-	 * Some Omen boards do not reliably leave fan-stop/user-defined state
-	 * when receiving another max_set(0). Force and verify a clear state edge.
-	 *
-	 * We do one trigger before the edge so commands latch while we're still
-	 * in userdefined context, but avoid post-edge triggers that can keep
-	 * userdefined mode alive and delay true AUTO handoff.
-	 */
-	ret = hp_wmi_get_fan_count_userdefine_trigger();
-	if (ret < 0)
-		return ret;
-
-	for (i = 0; i < USERDEFINED_EXIT_RETRIES; i++) {
-		ret = hp_wmi_fan_speed_max_set_verify(1, 3);
-		if (ret < 0)
-			return ret;
-
-		msleep(USERDEFINED_EXIT_PULSE_MS);
-
-		ret = hp_wmi_fan_speed_max_set_verify(0, 3);
-		if (ret < 0)
-			return ret;
-
-		/*
-		 * Small guard window lets EC apply the auto policy transition
-		 * before we decide whether another edge attempt is needed.
-		 */
-		msleep(USERDEFINED_EXIT_SETTLE_MS);
-		ret = hp_wmi_fan_speed_max_get();
-		if (ret < 0)
-			return ret;
-		if (ret == 0)
-			return 0;
-	}
-
-	pr_warn_ratelimited("failed to exit userdefined fan mode after retries\n");
-	return -EIO;
-}
 
  static int hp_wmi_fan_speed_set(struct hp_wmi_hwmon_priv *priv, u8 speed)
  {
@@ -2687,11 +2589,10 @@ static bool omen_has_gpu_thermal_modes(void)
 	 .remove = __exit_p(hp_wmi_bios_remove),
  };
  
- static int hp_wmi_apply_fan_settings(struct hp_wmi_hwmon_priv *priv,
-				      u8 prev_mode)
- {
+static int hp_wmi_apply_fan_settings(struct hp_wmi_hwmon_priv *priv)
+{
 	 int ret;
- 
+
 	 switch (priv->mode) {
 	 case PWM_MODE_MAX:
 		 if (is_victus_s_thermal_profile()) {
@@ -2706,63 +2607,32 @@ static bool omen_has_gpu_thermal_modes(void)
 				  secs_to_jiffies(KEEP_ALIVE_DELAY_SECS));
 		 return 0;
 	 case PWM_MODE_MANUAL:
-		 if (is_victus_s_thermal_profile()) {
-			 ret = hp_wmi_fan_speed_set(priv, pwm_to_rpm(priv->pwm, priv));
-			 if (ret < 0)
-				 return ret;
-			 mod_delayed_work(system_dfl_wq, &priv->keep_alive_dwork,
-					  secs_to_jiffies(KEEP_ALIVE_DELAY_SECS));
-			 return 0;
-		 }
-
-		 /*
-		  * Non-Victus boards use mode=1 as a fan-stop/user-defined request in
-		  * OmenCore. Keep firmware in user-defined mode and reset both fans to
-		  * automatic baseline to allow EC zero-RPM behavior when thermals allow.
-		  */
-		 ret = hp_wmi_fan_speed_max_set(0);
-		 if (ret < 0)
-			 return ret;
-		 ret = hp_wmi_get_fan_count_userdefine_trigger();
-		 if (ret < 0)
-			 return ret;
-		 ret = hp_wmi_omen_fan_speed_reset();
+		 if (!is_victus_s_thermal_profile())
+			 return -EOPNOTSUPP;
+		 ret = hp_wmi_fan_speed_set(priv, pwm_to_rpm(priv->pwm, priv));
 		 if (ret < 0)
 			 return ret;
 		 mod_delayed_work(system_dfl_wq, &priv->keep_alive_dwork,
 				  secs_to_jiffies(KEEP_ALIVE_DELAY_SECS));
 		 return 0;
 	 case PWM_MODE_AUTO:
-		 /*
-		  * Stop periodic userdefined refresh before AUTO handoff.
-		  * Must not be the _sync variant: we hold priv->lock here and
-		  * the keep-alive worker takes the same lock, so waiting for
-		  * it would deadlock. A concurrently running worker is
-		  * harmless, as it re-applies AUTO and does not re-schedule.
-		  */
-		 cancel_delayed_work(&priv->keep_alive_dwork);
 		 if (is_victus_s_thermal_profile()) {
 			 ret = hp_wmi_get_fan_count_userdefine_trigger();
 			 if (ret < 0)
 				 return ret;
 			 ret = hp_wmi_fan_speed_max_reset(priv);
-		 } else if (prev_mode == PWM_MODE_MANUAL) {
-			 /*
-			  * Only force the heavy exit-pulse sequence when fans
-			  * were actually in the userdefined fan-stop state.
-			  */
-			 ret = hp_wmi_omen_exit_userdefined_mode();
 		 } else {
 			 ret = hp_wmi_fan_speed_max_set(0);
 		 }
 		 if (ret < 0)
 			 return ret;
+		 cancel_delayed_work(&priv->keep_alive_dwork);
 		 return 0;
 	 default:
 		 /* shouldn't happen */
 		 return -EINVAL;
 	 }
- }
+}
  
  static umode_t hp_wmi_hwmon_is_visible(const void *data,
 						enum hwmon_sensor_types type,
@@ -2835,83 +2705,48 @@ static bool omen_has_gpu_thermal_modes(void)
 	 }
  }
  
- static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
+static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 				   u32 attr, int channel, long val)
- {
+{
 	 struct hp_wmi_hwmon_priv *priv;
-	 int rpm, ret;
 	 u8 prev_mode;
+	 int ret;
 
 	 priv = dev_get_drvdata(dev);
 	 guard(mutex)(&priv->lock);
 	 switch (type) {
 	 case hwmon_pwm:
-		 if (attr == hwmon_pwm_input) {
-			 if (!is_victus_s_thermal_profile())
-				 return -EOPNOTSUPP;
-			 /* PWM input is invalid when not in manual mode */
-			 if (priv->mode != PWM_MODE_MANUAL)
-				 return -EINVAL;
+		 /*
+		  * Manual PWM control (pwm1_enable=1) is intentionally not
+		  * exposed. On Omen/Victus boards it places the EC in a
+		  * user-defined state that can latch the fans at a fixed low
+		  * or zero speed while temperatures rise, which is a thermal
+		  * safety hazard. Only automatic (2, BIOS-controlled) and max
+		  * (0, full speed) are accepted; both always let the fans
+		  * respond to heat.
+		  */
+		 if (attr == hwmon_pwm_input)
+			 return -EOPNOTSUPP;
 
-			 /* ensure PWM input is within valid fan speeds */
-			 rpm = pwm_to_rpm(val, priv);
-			 rpm = clamp_val(rpm, priv->min_rpm, priv->max_rpm);
-			 priv->pwm = rpm_to_pwm(rpm, priv);
-			 return hp_wmi_apply_fan_settings(priv, priv->mode);
-		 }
 		 switch (val) {
 		 case PWM_MODE_MAX:
-			 prev_mode = priv->mode;
-			 priv->mode = PWM_MODE_MAX;
-			 ret = hp_wmi_apply_fan_settings(priv, prev_mode);
-			 if (ret < 0) {
-				 priv->mode = prev_mode;
-				 return ret;
-			 }
-			 return 0;
-		 case PWM_MODE_MANUAL:
-			 if (!is_victus_s_thermal_profile()) {
-				 prev_mode = priv->mode;
-				 priv->mode = PWM_MODE_MANUAL;
-				 ret = hp_wmi_apply_fan_settings(priv, prev_mode);
-				 if (ret < 0) {
-					 priv->mode = prev_mode;
-					 return ret;
-				 }
-				 return 0;
-			 }
-			 /*
-			  * When switching to manual mode, set fan speed to
-			  * current RPM values to ensure a smooth transition.
-			  */
-			 rpm = hp_wmi_get_fan_speed_victus_s(channel);
-			 if (rpm < 0)
-				 return rpm;
-			 priv->pwm = rpm_to_pwm(rpm / 100, priv);
-			 prev_mode = priv->mode;
-			 priv->mode = PWM_MODE_MANUAL;
-			 ret = hp_wmi_apply_fan_settings(priv, prev_mode);
-			 if (ret < 0) {
-				 priv->mode = prev_mode;
-				 return ret;
-			 }
-			 return 0;
 		 case PWM_MODE_AUTO:
 			 prev_mode = priv->mode;
-			 priv->mode = PWM_MODE_AUTO;
-			 ret = hp_wmi_apply_fan_settings(priv, prev_mode);
+			 priv->mode = val;
+			 ret = hp_wmi_apply_fan_settings(priv);
 			 if (ret < 0) {
 				 priv->mode = prev_mode;
 				 return ret;
 			 }
 			 return 0;
 		 default:
-			 return -EINVAL;
+			 /* PWM_MODE_MANUAL (1) and anything else are rejected. */
+			 return -EOPNOTSUPP;
 		 }
 	 default:
 		 return -EOPNOTSUPP;
 	 }
- }
+}
  
  static const struct hwmon_channel_info * const info[] = {
 	 HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
@@ -2944,7 +2779,7 @@ static bool omen_has_gpu_thermal_modes(void)
 	  * Re-apply the current hwmon context settings.
 	  * NOTE: hp_wmi_apply_fan_settings will handle the re-scheduling.
 	  */
-	 ret = hp_wmi_apply_fan_settings(priv, priv->mode);
+	 ret = hp_wmi_apply_fan_settings(priv);
 	 if (ret)
 		 pr_warn_ratelimited("keep-alive failed to refresh fan settings: %d\n",
 					 ret);
@@ -3038,7 +2873,7 @@ static bool omen_has_gpu_thermal_modes(void)
  
 	 INIT_DELAYED_WORK(&priv->keep_alive_dwork, hp_wmi_hwmon_keep_alive_handler);
 	 platform_set_drvdata(hp_wmi_platform_dev, priv);
-	 ret = hp_wmi_apply_fan_settings(priv, priv->mode);
+	 ret = hp_wmi_apply_fan_settings(priv);
 	 if (ret)
 		 dev_warn(dev, "Failed to apply initial fan settings: %d\n", ret);
  
