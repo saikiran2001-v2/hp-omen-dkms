@@ -61,6 +61,10 @@
  #define HP_POWER_LIMIT_DEFAULT	 0x00
  #define HP_POWER_LIMIT_NO_CHANGE 0xFF
  
+ #ifndef ACPI_AC_CLASS
+ #define ACPI_AC_CLASS "ac_adapter"
+ #endif
+ 
  #define zero_if_sup(tmp) (zero_insize_support?0:sizeof(tmp)) // use when zero insize is required
  
  enum hp_thermal_profile_omen_v0 {
@@ -2607,8 +2611,6 @@ static int hp_wmi_apply_fan_settings(struct hp_wmi_hwmon_priv *priv)
 				  secs_to_jiffies(KEEP_ALIVE_DELAY_SECS));
 		 return 0;
 	 case PWM_MODE_MANUAL:
-		 if (!is_victus_s_thermal_profile())
-			 return -EOPNOTSUPP;
 		 ret = hp_wmi_fan_speed_set(priv, pwm_to_rpm(priv->pwm, priv));
 		 if (ret < 0)
 			 return ret;
@@ -2640,8 +2642,8 @@ static int hp_wmi_apply_fan_settings(struct hp_wmi_hwmon_priv *priv)
  {
 	 switch (type) {
 	 case hwmon_pwm:
-		 if (attr == hwmon_pwm_input && !is_victus_s_thermal_profile())
-			 return 0;
+		 if (attr == hwmon_pwm_input)
+			 return 0644;
 		 return 0644;
 	 case hwmon_fan:
 		 if (is_victus_s_thermal_profile()) {
@@ -2725,12 +2727,15 @@ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 		  * (0, full speed) are accepted; both always let the fans
 		  * respond to heat.
 		  */
-		 if (attr == hwmon_pwm_input)
-			 return -EOPNOTSUPP;
+		 if (attr == hwmon_pwm_input) {
+			 priv->pwm = val;
+			 return hp_wmi_apply_fan_settings(priv);
+		 }
 
 		 switch (val) {
 		 case PWM_MODE_MAX:
 		 case PWM_MODE_AUTO:
+		 case PWM_MODE_MANUAL:
 			 prev_mode = priv->mode;
 			 priv->mode = val;
 			 ret = hp_wmi_apply_fan_settings(priv);
@@ -2740,8 +2745,7 @@ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 			 }
 			 return 0;
 		 default:
-			 /* PWM_MODE_MANUAL (1) and anything else are rejected. */
-			 return -EOPNOTSUPP;
+			 return -EINVAL;
 		 }
 	 default:
 		 return -EOPNOTSUPP;
