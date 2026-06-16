@@ -7,3 +7,5 @@
 Module.symvers
 modules.order
 .tmp_versions/
+hp-wmi.c.bak
+.hp-wmi.mod.cmd
